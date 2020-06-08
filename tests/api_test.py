@@ -38,6 +38,7 @@ from jax.interpreters import xla
 from jax.lib import xla_bridge as xb
 from jax import test_util as jtu
 from jax import tree_util
+from jax import linear_util as lu
 
 from jax.config import config
 config.parse_flags_with_absl()
@@ -235,7 +236,7 @@ class APITest(jtu.JaxTestCase):
     assert jit(f, static_argnums=(1,))(0, 5) == 10
     self.assertRaisesRegex(
         TypeError,
-        "('JaxprTracer' object cannot be interpreted as an integer"
+        "('JaxprTracer2' object cannot be interpreted as an integer"
         "|Abstract value passed to .*)",
         lambda: jit(f)(0, 5))
 
@@ -244,7 +245,7 @@ class APITest(jtu.JaxTestCase):
       f = lambda x: castfun(x)
       self.assertRaisesRegex(
           TypeError,
-          "('JaxprTracer' object cannot be interpreted as an integer"
+          "('JaxprTracer2' object cannot be interpreted as an integer"
           "|Abstract tracer value encountered where concrete value is expected .*)", lambda: jit(f)(0))
 
   def test_unimplemented_interpreter_rules(self):
@@ -921,7 +922,7 @@ class APITest(jtu.JaxTestCase):
     def f():
       return jnp.zeros((3, 4))
 
-    xla_comp = api.xla_computation(f, instantiate_const_outputs=True)()
+    xla_comp = api.xla_computation(f)()
     out_shape, = xla_comp.program_shape().result_shape().tuple_shapes()
     self.assertEqual(out_shape.dimensions(), (3, 4))
 
@@ -1179,7 +1180,7 @@ class APITest(jtu.JaxTestCase):
     self.assertEqual(vfoo(tree).shape, (6, 2, 5))
 
   def test_jit_reference_dropping(self):
-    x = np.ones(10)
+    x = jnp.ones(10)
     f = (lambda x: lambda: x)(x)  # reference to x in f's closure
     g = jit(f)
     x = weakref.ref(x)      # no more strong ref to x in this scope
@@ -1586,7 +1587,7 @@ class RematTest(jtu.JaxTestCase):
     finally:
       lax.sin_p.def_impl(sin_impl)
     num_calls = len(called)
-    self.assertEqual(num_calls, 1)
+    self.assertLessEqual(num_calls, 1)
 
   def test_remat_binomial_checkpointing(self):
     def binom_checkpoint(funs):
@@ -1711,13 +1712,21 @@ class RematTest(jtu.JaxTestCase):
 
   def test_remat_jit_static_argnum(self):
     # https://github.com/google/jax/issues/2833
+    # adapted after omnistaging changes
+    def named_call(f):
+      def named_f(*args):
+        f_ = lu.wrap_init(lambda: (f(*args),))
+        out, = core.call_p.bind(f_)
+        return out
+      return named_f
+
     def f(a_bool, y):
       if a_bool:
         return y + 1
       else:
         return y
 
-    api.jit(api.remat(f, concrete=True), static_argnums=0)(True, 1)  # no crash
+    api.jit(named_call(f), static_argnums=0)(True, 1)  # no crash
 
   def test_remat_eval_counter(self):
     # https://github.com/google/jax/issues/2737
@@ -1759,7 +1768,9 @@ class RematTest(jtu.JaxTestCase):
 
     @jax.util.curry
     def call(f, *args):
-      return jax.core.call(jax.linear_util.wrap_init(lambda *args: [f(*args)]), *args)[0]
+      return jax.core.call(
+          jax.linear_util.wrap_init(lambda *args: [f(*args)]),
+          *args, name='foo')[0]
 
     f = call(add_one)
     g = jax.remat(lambda x: add_one(f(x)))
@@ -1980,7 +1991,7 @@ class LazyTest(jtu.JaxTestCase):
   def test_constant_forcing_computations_cached(self):
     # from https://github.com/google/jax/issues/1909
     xla._lazy_force_computation.cache_clear()  # clear force compile cache
-    big_lazy_x = jnp.ones((api.device_count(), 100))
+    big_lazy_x = np.ones((api.device_count(), 100))
     f = api.pmap(lambda x: 2 * x)
     _ = f(big_lazy_x)
 
@@ -2207,8 +2218,6 @@ class CustomJVPTest(jtu.JaxTestCase):
     self.assertAllClose(ans, expected, check_dtypes=False)
 
   def test_closed_over_tracers_error_message(self):
-    raise unittest.SkipTest("TODO")  # TODO(mattjj)
-
     def f(x):
       @api.custom_jvp
       def g(y):
@@ -2240,7 +2249,7 @@ class CustomJVPTest(jtu.JaxTestCase):
     expected = (2., 3.)
     self.assertAllClose(ans, expected, check_dtypes=False)
 
-  def test_nondiff_arg_tracer(self):
+  def test_nondiff_arg_jit_tracer(self):
     @partial(api.custom_jvp, nondiff_argnums=(0,))
     def f(x, y):
       return x * y
@@ -2820,18 +2829,18 @@ class CustomVJPTest(jtu.JaxTestCase):
       return x  # identity function
 
     def clip_gradient_fwd(lo, hi, x):
-        # return x, None
-        return x, (hi, )
+      # return x, None
+      return x, (hi, )
 
     def clip_gradient_bwd(lo, hi, _, g):
-        return (jnp.clip(g, lo, hi),)
+      return (jnp.clip(g, lo, hi),)
 
     _clip_gradient.defvjp(clip_gradient_fwd, clip_gradient_bwd)
 
     def clip_gradient(x):
-        lo = -1
-        hi = x + 1  # causes things to break
-        return _clip_gradient(lo, hi, x)
+      lo = -1
+      hi = x + 1  # causes things to break
+      return _clip_gradient(lo, hi, x)
 
     jax.grad(clip_gradient)(1.)  # doesn't crash
 
@@ -3198,8 +3207,12 @@ class BufferDonationTest(jtu.JaxTestCase):
   def test_jit_nested_donate_ignored(self):
     jit_fun = jit(lambda x: jit(lambda y: y ** 2, donate_argnums=0)(x))
     a = jax.device_put(jnp.array(1))
-    with self.assertRaisesRegex(ValueError, "nested.*not supported"):
-      jit_fun(a)
+
+    # NOTE(mattjj): stopped raising error here and instead just ignored
+    # with self.assertRaisesRegex(ValueError, "nested.*not supported"):
+    #   jit_fun(a)
+
+    jit_fun(a)  # doesn't crash
 
   def test_jnp_array_copy(self):
     # https://github.com/google/jax/issues/3412
@@ -3229,11 +3242,15 @@ class BufferDonationTest(jtu.JaxTestCase):
     self.assertDeleted(x)
     np.testing.assert_allclose(y, [1.] * n)
 
-  def test_pmap_nested_donate_raises(self):
+  def test_pmap_nested_donate_ignored(self):
     pmap_fun = jit(lambda x: api.pmap(lambda y: y ** 2, donate_argnums=0)(x))
     a = api.pmap(lambda x: x)(jnp.array([1]))
-    with self.assertRaisesRegex(ValueError, "nested.*not supported"):
-      pmap_fun(a)
+
+    # NOTE(mattjj): stopped raising error here and instead just ignored
+    # with self.assertRaisesRegex(ValueError, "nested.*not supported"):
+    #   pmap_fun(a)
+
+    pmap_fun(a)  # doesn't crash
 
   assertDeleted = lambda self, x: self._assertDeleted(x, True)
   assertNotDeleted = lambda self, x: self._assertDeleted(x, False)
